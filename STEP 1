@@ -1,0 +1,135 @@
+# -*- coding: utf-8 -*-
+import time
+import numpy as np
+import math
+import pandas as pd
+
+DEG = "\N{DEGREE SIGN}"                 
+
+pi, d2r, r2d = np.pi, np.pi/180, 180/np.pi
+
+def DH_T(alpha, a, d, theta):
+    ca, sa, ct, st = math.cos(alpha), math.sin(alpha), math.cos(theta), math.sin(theta)
+    return np.array([[   ct,   -st,   0,     a],
+                     [st*ca, ct*ca, -sa, -d*sa],
+                     [st*sa, ct*sa,  ca,  d*ca],
+                     [    0,     0,   0,     1]])
+    
+def forward_kinematics(theta):  
+    
+    # ---- DH Parameters ----
+    a = [0, 0, 0.4251, 0.39215, 0, 0]
+    alpha = [0, pi/2, 0, 0, pi/2, -pi/2]
+    d = [0.0892, 0, 0, 0.11, 0.09475, 0.26658]  
+    theta_offset = [-pi/2, pi/2, 0, pi/2, 0, 0]    
+     
+    T = np.eye(4)
+    for i in range(6):
+        T = T @ DH_T(alpha[i], a[i], d[i], theta[i] + theta_offset[i])
+    
+    position, R = T[:3, 3], T[:3, :3]
+    
+    # XYZ (roll-pitch-yaw) จาก rotation matrix
+    r02 = float(np.clip(R[0, 2], -1.0, 1.0))
+    beta = math.asin(r02)
+    if abs(r02) < 1.0 - 1e-9:
+        alpha = math.atan2(-R[1, 2], R[2, 2])
+        gamma = math.atan2(-R[0, 1], R[0, 0])
+    else:
+        alpha = 0.0
+        gamma = math.atan2(R[1, 0], R[1, 1])
+    
+    return position, np.array([alpha, beta, gamma]), T
+
+def _wrap_to_pi(angle):
+    return (angle + np.pi) % (2*np.pi) - np.pi
+
+def _angle_delta(a1, a0):
+    return _wrap_to_pi(a1 - a0)
+
+def _pose(theta):
+    p, eul, _ = forward_kinematics(theta)
+    return np.hstack([p, eul])
+
+def numerical_jacobian(theta, eps=1e-6):
+    theta = np.array(theta, float)
+    y0 = _pose(theta)
+    J = np.zeros((6, 6))
+    for i in range(len(theta)):
+        th = theta.copy(); th[i] += eps
+        y1 = _pose(th)
+        dp = (y1[:3] - y0[:3]) / eps
+        de = np.array([
+            _angle_delta(y1[3], y0[3]),
+            _angle_delta(y1[4], y0[4]),
+            _angle_delta(y1[5], y0[5])
+        ]) / eps
+        J[:, i] = np.hstack([dp, de])
+    return J
+
+
+def sysCall_init():
+    sim = require("sim")  
+
+
+def sysCall_thread():
+    hdl_j = {}
+    hdl_j[0] = sim.getObject("/UR5/joint")
+    hdl_j[1] = sim.getObject("/UR5/joint/link/joint")
+    hdl_j[2] = sim.getObject("/UR5/joint/link/joint/link/joint")
+    hdl_j[3] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint")
+    hdl_j[4] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint")
+    hdl_j[5] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint")
+
+    hdl_end = sim.getObject("/UR5/EndPoint")
+
+    t1 = time.time()
+    np.set_printoptions(precision=4, suppress=True, linewidth=120)
+
+    print("UR5 Forward Kinematics and Orientation Display")
+    print("=" * 60)
+
+    while (t := time.time() - t1) < 10:
+        base = 45*d2r*np.sin(0.01*pi*t)
+        tgt  = np.array([base, .8*base, .6*base, .4*base, .3*base, .2*base])
+        for i in range(6): sim.setJointTargetPosition(hdl_j[i], float(tgt[i]))
+
+        actual_angles = {i: sim.getJointPosition(hdl_j[i]) for i in range(6)}
+        theta_array = [actual_angles[i] for i in range(6)]
+        
+        calc_position, calc_orientation, _ = forward_kinematics(theta_array)
+
+        sim_position = sim.getObjectPosition(hdl_end, -1)
+        sim_orientation = sim.getObjectOrientation(hdl_end, -1)
+
+        calc_orientation_deg = calc_orientation * r2d
+        sim_orientation_deg = np.array(sim_orientation) * r2d
+
+        joint_deg = {i: round(actual_angles[i] * r2d, 2) for i in range(6)}
+        print("\n")
+        print("-" * 40)
+        print(f"Joint Angles (deg): {joint_deg}")
+        print(f"Time: {t:.2f}s")
+        print("-" * 40)
+        print(f"End Position CAL: X={calc_position[0]:.4f}, Y={calc_position[1]:.4f}, Z={calc_position[2]:.4f}")
+        print(f"End Position SIM: X={sim_position[0]:.4f}, Y={sim_position[1]:.4f}, Z={sim_position[2]:.4f}\n")
+        print("End Orientation CAL (XYZ Euler angles):")  
+        print(f"  Roll (X): {calc_orientation_deg[0]:.2f}{DEG}")
+        print(f"  Pitch (Y): {calc_orientation_deg[1]:.2f}{DEG}")
+        print(f"  Yaw (Z): {calc_orientation_deg[2]:.2f}{DEG}")
+        print("End Orientation SIM(XYZ Euler angles):")
+        print(f"  Roll (X): {sim_orientation_deg[0]:.2f}{DEG}")
+        print(f"  Pitch (Y): {sim_orientation_deg[1]:.2f}{DEG}")
+        print(f"  Yaw (Z): {sim_orientation_deg[2]:.2f}{DEG}\n")
+        
+        J_num = numerical_jacobian(theta_array, eps=1e-6)
+        cols = [f"J{i+1}" for i in range(6)]
+        rows = ["dX","dY","dZ","dRoll","dPitch","dYaw"]
+        df = pd.DataFrame(J_num, columns=cols, index=rows)
+
+        print("\nNumerical Jacobian (6x6):")
+        print(df.to_string(float_format=lambda x: f"{x: .6f}"))
+
+        time.sleep(0.1)
+        sim.switchThread()
+    pass
