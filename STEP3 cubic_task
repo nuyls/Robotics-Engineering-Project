@@ -1,0 +1,261 @@
+import numpy as np
+import math as m
+import random as rand
+
+# ===== Basics =====
+pi = np.pi; d2r = pi/180.0; r2d = 1.0/d2r
+
+# ===== Globals (DH in degrees) =====
+DH_table = None
+DH_size  = 0
+Pe   = np.array([0, 0, 0, 1.0], float)
+Ende = np.array([0, 0, 0.19163, 1.0], float)
+
+# ===== Helpers =====
+def degarr2radarr(deg_dict_or_arr):
+    if isinstance(deg_dict_or_arr, dict):
+        arr_deg = np.array([deg_dict_or_arr.get(i, 0.0) for i in range(6)], float)
+    else:
+        arr_deg = np.array(deg_dict_or_arr, float)
+    return arr_deg * d2r
+
+def dh_transforms(alpha_deg, a, d, theta_deg):
+    th = theta_deg * d2r; al = alpha_deg * d2r
+    ca, sa = m.cos(al), m.sin(al); ct, st = m.cos(th), m.sin(th)
+    return np.array([
+        [ ct, -st, 0, a],
+        [st*ca, ct*ca, -sa, -sa*d],
+        [st*sa, ct*sa,  ca,  ca*d],
+        [  0,    0,    0,  1]], float)
+
+def Homogeneous_trans_matrix(first, last):
+    global DH_table
+    Tn = np.eye(4)
+    for t in range(first, last):
+        alpha, a, d, theta = DH_table[t]
+        Tn = Tn @ dh_transforms(alpha, a, d, theta)
+    return Tn
+
+def rotation_matrix(first, last):
+    return Homogeneous_trans_matrix(first, last)[:3,:3]
+
+def forward_kinematic():
+    return (Homogeneous_trans_matrix(0, DH_size) @ Pe)[:3].astype(float)
+
+# (คงชื่อเก่าไว้เพื่อความเข้ากันได้)
+def foward_kinematic():  # noqa
+    return forward_kinematic()
+
+def eulerXYZ_deg_from_R(R):
+    # Euler XYZ
+    alpha = m.atan2(-R[1,2], R[2,2]) * r2d
+    beta  = m.asin(max(-1.0, min(1.0, R[0,2]))) * r2d
+    gamma = m.atan2(-R[0,1], R[0,0]) * r2d
+    return np.array([alpha, beta, gamma], float)
+
+def Euler():
+    R = rotation_matrix(0, DH_size)
+    return eulerXYZ_deg_from_R(R)
+
+# ===== Geometric Jacobian (base frame) =====
+def Jacobian_matrix():
+    J_cols = []
+    for i in range(1, DH_size):
+        rE_in_i  = Homogeneous_trans_matrix(i, DH_size-1) @ Ende  # EE in frame i
+        R0i      = rotation_matrix(0, i)
+        r0       = R0i @ rE_in_i[:3]
+        k0       = R0i @ np.array([0,0,1.0])
+        J_cols.append(np.hstack([np.cross(k0, r0), k0]))
+    return np.stack(J_cols, axis=1)  # 6x6
+
+# ===== Pose / Errors =====
+def current_pose():
+    p = forward_kinematic().astype(float)
+    R = rotation_matrix(0, DH_size)
+    return p, R
+
+def rotvec_error(R_cur, R_des):
+    # eω = Log(R_des * R_cur^T)  (axis-angle vector, radians)
+    Re = R_des @ R_cur.T
+    c = max(-1.0, min(1.0, 0.5*(np.trace(Re)-1.0)))
+    ang = m.acos(c)
+    if ang < 1e-9: return np.zeros(3)
+    den = 2.0*m.sin(ang)
+    v = np.array([Re[2,1]-Re[1,2], Re[0,2]-Re[2,0], Re[1,0]-Re[0,1]])/den
+    return v*ang
+
+def pose_error6(p_des, R_des):
+    p_cur, R_cur = current_pose()
+    dp = np.asarray(p_des, float) - p_cur
+    e_om = rotvec_error(R_cur, R_des)
+    return np.hstack([dp, e_om])
+
+def MSE(p_des, R_des):
+    e6 = pose_error6(p_des, R_des)
+    return float(np.mean(e6**2))
+
+# ===== DLS (damped least-squares) with weights =====
+def dls_6d(J, e6, lam=0.02, wpos=10.0, wori=2.0):
+    W = np.diag([wpos,wpos,wpos,wori,wori,wori])
+    JW = W @ J
+    eW = W @ e6
+    return JW.T @ np.linalg.solve(JW@JW.T + (lam**2)*np.eye(6), eW)
+
+def inverse_kinematic(p_des, R_des, alpha, theta_deg_dict_or_arr,
+                      lam=0.02, wpos=10.0, wori=2.0, dq_clip=12.0*d2r):
+    e6  = pose_error6(p_des, R_des)
+    J   = Jacobian_matrix()
+    dq  = dls_6d(J, e6, lam=lam, wpos=wpos, wori=wori)
+    dq  = np.clip(dq, -dq_clip, dq_clip)  # rad
+    th0 = degarr2radarr(theta_deg_dict_or_arr)
+    return th0 + alpha*dq  # rad
+
+# ===== Cubic time-scaling s(t) with v(0)=v(T)=0 =====
+def cubic_position(u0, uf, v0, vf, tf, t):
+    dt=tf; a0=u0; a1=v0
+    a2=(3*(uf-u0)-(2*v0+vf)*dt)/(dt**2)
+    a3=(2*(u0-uf)+(v0+vf)*dt)/(dt**3)
+    return a0 + a1*t + a2*t*t + a3*t*t*t
+
+# ===== Task sampling & DH =====
+def build_ur5_dh_from_deg(th_deg_dict):
+    return np.array([
+        [0,    0,       0.0892,  -90 + th_deg_dict.get(0)],
+        [90,   0,       0,        90 + th_deg_dict.get(1)],
+        [0,    0.4251,  0,         th_deg_dict.get(2)],
+        [0,    0.39215, 0.110,    -90 + th_deg_dict.get(3)],
+        [-90,  0,       0.09475,     th_deg_dict.get(4)],
+        [90,   0,       0.0,         th_deg_dict.get(5)],
+        [0,    0,       0.26658,    180]
+    ], float)
+
+def set_DH_from_th(th_deg_dict):
+    global DH_table, DH_size
+    DH_table = build_ur5_dh_from_deg(th_deg_dict)
+    DH_size  = len(DH_table)
+
+def set_sim_joints_from_deg(sim, hdl_j, th_deg_dict):
+    for i in range(6):
+        sim.setJointTargetPosition(hdl_j[i], th_deg_dict.get(i,0.0)*d2r)
+
+# เวิร์กสเปซที่ใช้งานได้กับ UR5 (ปลอดภัยกว่า)
+def sample_task_point():
+    x = rand.uniform(0.25, 0.65)
+    y = rand.uniform(-0.35, 0.35)
+    z = rand.uniform(0.25, 0.85)
+    return np.array([x, y, z], float)
+
+def solve_IK_to_pose(p_des, R_des, th_seed_deg, alpha=0.03, iters=1500, tol=1e-4):
+    th = dict(th_seed_deg)
+    for _ in range(iters):
+        set_DH_from_th(th)
+        if np.linalg.norm(pose_error6(p_des, R_des)) <= tol: break
+        th_rad = inverse_kinematic(p_des, R_des, alpha, th, lam=0.02, wpos=9.0, wori=2.0)
+        th = dict(enumerate((th_rad*r2d).tolist()))
+    return th
+
+# ===== Time selection from per-axis amax =====
+def choose_T_cubic_axes(p0, pf, amax_lin_xyz, T_req):
+    dp = np.abs(np.asarray(pf)-np.asarray(p0))
+    amax = np.asarray(amax_lin_xyz, float)
+    T_axes = np.sqrt(np.where(dp>0, 6.0*dp/np.maximum(amax,1e-9), 0.0))
+    T_min = float(np.max(T_axes))
+    return max(float(T_req), T_min)
+
+# ===== Main trial (uses simulation time) =====
+def run_trial(trial_id, sim, hdl_j, hdl_end, T_req=8.0, alpha=0.02, err_thresh=4e-3,
+              max_iters=1200, amax_lin_xyz=(1.0,1.0,1.0), dt=0.02):
+    rand.seed(trial_id); np.random.seed(trial_id)
+
+    # 1) สุ่มจุดใน task space
+    p_start_des = sample_task_point()
+    p_goal_des  = sample_task_point()
+
+    # 2) ตั้ง seed joints และคง orientation จากท่าเริ่ม
+    th0 = {i: 0.0 for i in range(6)}
+    set_DH_from_th(th0)
+    _, R_meas = current_pose()
+    R_des = R_meas.copy()  # orientation goal (fixed)
+    print(f"\n=== CASE #{trial_id} ===")
+    print("R_des (Euler XYZ deg) =", np.round(eulerXYZ_deg_from_R(R_des), 2))
+
+    # 3) หา qA ให้ถึง p_start (คง R_des)
+    th0 = solve_IK_to_pose(p_start_des, R_des, th0, alpha=0.03, iters=1500, tol=1e-4)
+    set_sim_joints_from_deg(sim, hdl_j, th0); set_DH_from_th(th0)
+    p_start, _ = current_pose()
+
+    # 4) หา qB เพื่อไว้ส่งเข้าที่ปลาย (fine align)
+    thf = solve_IK_to_pose(p_goal_des, R_des, th0, alpha=0.03, iters=1500, tol=1e-4)
+
+    # 5) เลือกเวลา T จาก amax ต่อแกน
+    T_used = choose_T_cubic_axes(p_start, p_goal_des, amax_lin_xyz, T_req)
+    print(f"p_start={np.round(p_start,4)}  p_goal={np.round(p_goal_des,4)}")
+    print(f"amax_xyz={amax_lin_xyz}  T_req={T_req:.2f}s  T_used={T_used:.2f}s")
+
+    # 6) วิ่ง A->B ด้วย cubic time-scaling s(t); IK แบบ Jacobian+DLS; ใช้เวลาซิม
+    t0 = sim.getSimulationTime()
+    u0, uf, v0, vf = 0.0, 1.0, 0.0, 0.0
+    th_cur = dict(th0)
+
+    while True:
+        t = sim.getSimulationTime() - t0
+        if t > T_used: break
+        s = cubic_position(u0, uf, v0, vf, T_used, t)
+        p_des = p_start + (p_goal_des - p_start) * s
+
+        # inner IK steps (pos heavy, ori light)
+        for _ in range(2):
+            set_DH_from_th(th_cur)
+            th_rad = inverse_kinematic(p_des, R_des, alpha, th_cur,
+                                       lam=0.02, wpos=10.0, wori=2.0, dq_clip=12.0*d2r)
+            th_cur = dict(enumerate((th_rad*r2d).tolist()))
+        set_sim_joints_from_deg(sim, hdl_j, th_cur)
+
+        # log ~1 Hz: ตำแหน่ง + orientation ปัจจุบัน + ขนาด error เชิงมุม
+        if int(10*t) % 10 == 0:
+            err6 = MSE(p_des, R_des)
+            _, R_cur = current_pose()
+            eul_cur = eulerXYZ_deg_from_R(R_cur)
+            ang_err_deg = np.linalg.norm(rotvec_error(R_cur, R_des))*r2d
+            print(
+                f"t={t:5.2f}s  s={s:5.3f}  pos={np.round(p_des,3)}  "
+                f"eul_cur(deg)={np.round(eul_cur,2)}  |ang_err|={ang_err_deg:.3f} deg  mse6={err6:.2e}"
+            )
+
+        sim.switchThread()
+
+    # 7) ส่งไปที่ท่าจบ (เผื่อ fine align)
+    set_sim_joints_from_deg(sim, hdl_j, thf)
+    print("Done: reached target with fixed orientation.")
+
+# ===== CoppeliaSim hooks =====
+def sysCall_init():
+    global sim
+    sim = require('sim')
+
+def sysCall_thread():
+    hdl_j={}
+    hdl_j[0] = sim.getObject("/UR5/joint")
+    hdl_j[1] = sim.getObject("/UR5/joint/link/joint")
+    hdl_j[2] = sim.getObject("/UR5/joint/link/joint/link/joint")
+    hdl_j[3] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint")
+    hdl_j[4] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint")
+    hdl_j[5] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint")
+    hdl_end = sim.getObject("/UR5/EndPoint")
+
+    for k in range(1, 4):
+        run_trial(
+            trial_id=k,
+            sim=sim, hdl_j=hdl_j, hdl_end=hdl_end,
+            T_req=8.0,                # กำหนด T ที่ต้องการ (ระบบจะเพิ่มให้พอตาม amax หากสั้นเกิน)
+            alpha=0.02,               # step gain ของ IK
+            err_thresh=4e-3,
+            max_iters=1200,
+            amax_lin_xyz=(1.0,1.0,1.0),  # m/s^2 ต่อแกน X,Y,Z
+            dt=0.02
+        )
+        # hold เล็กน้อยระหว่างเคส โดยใช้เวลาซิม
+        t0 = sim.getSimulationTime()
+        while sim.getSimulationTime() - t0 < 2.0:
+            sim.switchThread()
+    print("\n=== ALL TESTS COMPLETED ===")
