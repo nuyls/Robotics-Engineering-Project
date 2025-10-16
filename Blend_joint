@@ -1,0 +1,157 @@
+import time
+import numpy as np
+import math as m
+import random as rand
+
+# ===== Consts =====
+PI = np.pi
+DEG2RAD, RAD2DEG = PI/180, 180/PI
+HOME_DEG = [0.0, -90.0, 90.0, 0.0, 90.0, 0.0]
+
+# ===== DH globals =====
+DH, DH_N, IDX0, IDX1 = None, 0, 0, 0
+P_BASE = np.array([0, 0, 0, 1.0])
+P_TOOL = np.array([0, 0, 0.19163, 1.0])
+
+# ===== Kinematics =====
+def dh_T(alpha, a, d, theta):
+    cA, sA, cT, sT = m.cos(alpha), m.sin(alpha), m.cos(theta), m.sin(theta)
+    return np.array([[cT, -sT, 0, a],
+                     [sT*cA, cT*cA, -sA, -d*sA],
+                     [sT*sA, cT*sA,  cA,  d*cA],
+                     [0, 0, 0, 1.0]], float)
+
+def T_range(i0, i1):
+    T = np.identity(4)
+    for i in range(i0, i1):
+        aD, a, d, tD = DH[i]
+        T = T @ dh_T(aD*DEG2RAD, a, d, tD*DEG2RAD)
+    return T
+
+def R_range(i0, i1): 
+    return T_range(i0, i1)[:3, :3]
+
+def euler_deg():
+    R = R_range(IDX0, IDX1); EPS = 1e-9
+    r02 = max(-1.0, min(1.0, float(R[0,2])))
+    beta = m.asin(r02)
+    if abs(r02) < 1.0 - EPS:
+        alpha = m.atan2(-R[1,2], R[2,2])
+        gamma = m.atan2(-R[0,1], R[0,0])
+    else:
+        alpha = 0.0
+        gamma = m.atan2(R[1,0], R[1,1])
+    return np.array([alpha, beta, gamma]) * RAD2DEG
+
+def fk_pos():
+    return (T_range(IDX0, IDX1) @ P_BASE)[:3].round(6)
+
+def jacobian():  # (???????????????? ????????????????????)
+    cols = []
+    for i in range(1, DH_N):
+        r   = (T_range(i, DH_N-1) @ P_TOOL)[:3]
+        R0i = R_range(0, i)
+        r0, k0 = R0i @ r, R0i @ np.array([0,0,1.0])
+        cols.append(np.r_[np.cross(k0, r0), k0])
+    return np.array(cols).T
+
+# ===== LSPB =====
+def lspb_plan(q0, qf, a_max, T):
+    q0, qf = float(q0), float(qf); dq = qf - q0
+    s = 1.0 if dq >= 0 else -1.0
+    a = float(max(abs(a_max), 1e-6)); T = float(max(T, 1e-6))
+    Tmin = 2.0*m.sqrt(abs(dq)/a)
+    if T < Tmin: T = Tmin
+    disc = max(T*T - 4.0*abs(dq)/a, 0.0)
+    tb = 0.5*(T - m.sqrt(disc)); vmax = a*tb; d_blend = 0.5*a*tb*tb
+    return {"q0":q0,"qf":qf,"s":s,"a":a,"T":T,"tb":tb,"vmax":vmax,"d_blend":d_blend}
+
+def lspb_pos(p, t):
+    q0,qf,s,a,T,tb,vmax,d_blend = p["q0"],p["qf"],p["s"],p["a"],p["T"],p["tb"],p["vmax"],p["d_blend"]
+    t = float(min(max(t, 0.0), T))
+    if t < tb: return q0 + s*(0.5*a*t*t)
+    if t <= T - tb: return q0 + s*(d_blend + vmax*(t - tb))
+    td = T - t; return qf - s*(0.5*a*td*td)
+
+ACC_LIM = np.array([80, 80, 100, 150, 150, 200], float)
+
+def pick_T(q0, qf, a_lim, T_min=2.0):
+    Tmin = max(2.0*m.sqrt(abs(float(qf[i]-q0[i]))/max(a_lim[i],1e-6)) for i in range(6))
+    return max(Tmin, float(T_min))
+
+# ===== CoppeliaSim =====
+def sysCall_init():
+    global sim
+    sim = require('sim')
+
+def sysCall_thread():
+    global DH, DH_N, IDX0, IDX1
+
+    # --- handles ---
+    hdl_j = {}
+    hdl_j[0] = sim.getObject("/UR5/joint")
+    hdl_j[1] = sim.getObject("/UR5/joint/link/joint")
+    hdl_j[2] = sim.getObject("/UR5/joint/link/joint/link/joint")
+    hdl_j[3] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint")
+    hdl_j[4] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint")
+    hdl_j[5] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint")
+    hdl_end = sim.getObject("/UR5/EndPoint")
+
+    print("\n========= JOINT-SPACE: 3 cases (LSPB: v0=vf=0) =========")
+
+    # Move to HOME pose first
+    for i in range(6):
+        sim.setJointTargetPosition(hdl_j[i], HOME_DEG[i]*DEG2RAD)
+    t0 = time.time()
+    while time.time()-t0 < 1.0:
+        sim.switchThread()
+    print("Moved HOME (deg):", HOME_DEG)
+
+    for case in range(1, 4):
+        q0 = {i: rand.randrange(-60, 61) for i in range(6)}
+        qf = {i: rand.randrange(-60, 61) for i in range(6)}
+        Tf = pick_T(q0, qf, ACC_LIM, T_min=4.0)
+
+        plans = {i: lspb_plan(q0[i], qf[i], ACC_LIM[i], Tf) for i in range(6)}
+        tb_list  = [round(plans[i]["tb"],   4) for i in range(6)]
+        vm_list  = [round(plans[i]["vmax"], 3) for i in range(6)]
+
+        print(f"\n---------- Case {case}/3 ----------")
+        print("Start (deg):", q0)
+        print("Stop  (deg):", qf)
+        print("tf:", round(Tf,3), "s | tb:", tb_list, "s | vmax:", vm_list, "deg/s")
+        print("a_lim:", ACC_LIM.tolist())
+
+        for i in range(6):
+            sim.setJointTargetPosition(hdl_j[i], q0[i]*DEG2RAD)
+        sim.switchThread()
+
+        print("Start moving (LSPB)...")
+        t, t0 = 0.0, time.time()
+        while t < Tf:
+            q = {i: lspb_pos(plans[i], t) for i in range(6)}
+            for i in range(6):
+                sim.setJointTargetPosition(hdl_j[i], q[i]*DEG2RAD)
+
+            # Update DH each step
+            DH = np.array([
+                [  0, 0,       0.0892, -90 + q[0]],
+                [ 90, 0,       0.0,     90 + q[1]],
+                [  0, 0.4251,  0.0,           q[2]],
+                [  0, 0.39215, 0.110,  -90 + q[3]],
+                [-90, 0,       0.09475,       q[4]],
+                [ 90, 0,       0.0,           q[5]],
+                [  0, 0,       0.26658,      180]
+            ], float)
+            DH_N, IDX0, IDX1 = len(DH), 0, len(DH)
+
+            t = time.time() - t0
+            sim.switchThread()
+
+        print(f"Stop (Case {case})")
+        t_wait = time.time()
+        while time.time()-t_wait < 3.0:
+            sim.switchThread()
+
+    print("\nAll 3 cases done.")
+    pass
