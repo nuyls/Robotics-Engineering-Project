@@ -1,0 +1,130 @@
+# =========================================================
+# Joint-Space Cubic (v(0)=v(T)=0) — UR5 — 3 Trials
+# =========================================================
+
+import numpy as np
+import math as m
+import random as rand
+
+# ------------------------ Settings ------------------------
+NUM_TRIALS          = 3          
+JOINT_RANGE_DEG     = 60         
+MIN_DURATION_SEC    = 4.0        
+HOLD_BEFORE_SEC     = 1.5        
+HOLD_AFTER_SEC      = 1.5       
+
+# a_max (deg/s^2)
+JOINT_AMAX_DEG_S2   = np.array([80, 80, 100, 150, 150, 200], dtype=float)
+
+# ------------------------ Helpers ------------------------
+PI      = np.pi
+DEG2RAD = PI / 180.0
+RAD2DEG = 1.0 / DEG2RAD
+
+# q(t) = q0 + 3Δq (t/T)^2 − 2Δq (t/T)^3  (v(0)=v(T)=0)
+def cubic_pos_deg(q0_deg, q1_deg, T, t):
+    d = q1_deg - q0_deg
+    s2 = (t*t) / (T*T)
+    s3 = s2 * (t/T)
+    return q0_deg + 3.0*d*s2 - 2.0*d*s3
+
+def cubic_vel_deg(q0_deg, q1_deg, T, t):
+    d = q1_deg - q0_deg
+    return (6.0*d/(T*T))*t - (6.0*d/(T*T*T))*(t*t)
+
+def cubic_acc_deg(q0_deg, q1_deg, T, t):
+    d = q1_deg - q0_deg
+    return (6.0*d/(T*T)) - (12.0*d/(T*T*T))*t
+
+def sample_start_goal_deg(range_deg=60):
+    q_start = np.zeros(6, float)
+    q_goal  = np.zeros(6, float)
+    for i in range(6):
+        q_start[i] = rand.randrange(-range_deg, range_deg + 1)
+        q_goal[i]  = rand.randrange(-range_deg, range_deg + 1)
+    return q_start, q_goal
+
+def choose_duration_from_amax(q_start_deg, q_goal_deg, amax_deg_s2, min_T):
+    # |a|max (cubic) = 6|Δq|/T^2  →  T >= sqrt(6|Δq|/a_max)
+    delta = np.abs(q_goal_deg - q_start_deg)
+    T_need_each = np.sqrt(6.0*delta / np.maximum(amax_deg_s2, 1e-9))
+    T_need = float(np.max(np.nan_to_num(T_need_each, nan=0.0)))
+    return max(T_need, float(min_T))
+
+def send_joint_targets_deg(sim, joint_handles, q_deg):
+    for i in range(6):
+        sim.setJointTargetPosition(joint_handles[i], float(q_deg[i] * DEG2RAD))
+
+# ------------------------ CoppeliaSim Hooks ------------------------
+def sysCall_init():
+    sim = require('sim')
+
+def sysCall_thread():
+    # Handles (ปรับ path ถ้าโมเดลต่าง)
+    joint_handles = [None]*6
+    joint_handles[0] = sim.getObject("/UR5/joint")
+    joint_handles[1] = sim.getObject("/UR5/joint/link/joint")
+    joint_handles[2] = sim.getObject("/UR5/joint/link/joint/link/joint")
+    joint_handles[3] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint")
+    joint_handles[4] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint")
+    joint_handles[5] = sim.getObject("/UR5/joint/link/joint/link/joint/link/joint/link/joint/link/joint")
+
+    print("\n========= JOINT-SPACE CUBIC (v0=vf=0) : 3 TRIALS =========")
+
+    for trial_idx in range(1, NUM_TRIALS + 1):
+        # --- Random start/goal (deg) ---
+        q_start_deg, q_goal_deg = sample_start_goal_deg(JOINT_RANGE_DEG)
+
+        # --- Pick duration T from a_max ---
+        T_move = choose_duration_from_amax(q_start_deg, q_goal_deg,
+                                           JOINT_AMAX_DEG_S2, MIN_DURATION_SEC)
+
+        a_theory = 6.0 * np.abs(q_goal_deg - q_start_deg) / (T_move*T_move)
+
+        print(f"\n---------- Trial {trial_idx}/{NUM_TRIALS} ----------")
+        print("q_start (deg):", q_start_deg.round(2))
+        print("q_goal  (deg):", q_goal_deg.round(2))
+        print("T (s):", round(T_move, 3))
+        print("a_theory (deg/s^2):", a_theory.round(2).tolist())
+        print("a_limit  (deg/s^2):", JOINT_AMAX_DEG_S2.tolist())
+
+        # --- Move softly to start and hold ---
+        t0 = sim.getSimulationTime()
+        while sim.getSimulationTime() - t0 < 0.5:
+            send_joint_targets_deg(sim, joint_handles, q_start_deg)
+            sim.switchThread()
+
+        t_hold = sim.getSimulationTime()
+        while sim.getSimulationTime() - t_hold < HOLD_BEFORE_SEC:
+            send_joint_targets_deg(sim, joint_handles, q_start_deg)
+            sim.switchThread()
+
+        # --- Run cubic from start to goal ---
+        t0 = sim.getSimulationTime()
+        delta_deg = q_goal_deg - q_start_deg
+        while True:
+            t = sim.getSimulationTime() - t0
+            if t < 0.0: t = 0.0
+            if t > T_move: t = T_move
+
+            s2 = (t*t) / (T_move*T_move)
+            s3 = s2 * (t / T_move)
+            q_cmd_deg = q_start_deg + 3.0*delta_deg*s2 - 2.0*delta_deg*s3
+
+            send_joint_targets_deg(sim, joint_handles, q_cmd_deg)
+
+            if t >= T_move:
+                break
+            sim.switchThread()
+
+        # --- Hold at goal ---
+        t_hold = sim.getSimulationTime()
+        while sim.getSimulationTime() - t_hold < HOLD_AFTER_SEC:
+            send_joint_targets_deg(sim, joint_handles, q_goal_deg)
+            sim.switchThread()
+
+    print("\nAll trials done.")
+
+def sysCall_actuation(): pass
+def sysCall_sensing():   pass
+def sysCall_cleanup():   pass
